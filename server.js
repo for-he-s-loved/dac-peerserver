@@ -1,24 +1,128 @@
-const express = require('express');
-const { ExpressPeerServer } = require('peer');
+// Divide & Conquer relay — plain WebSocket message bus by 4-letter room code.
+// Two clients per room (host + joiner). Server forwards JSON messages between
+// them. No WebRTC, no ICE, no TURN — works on any network with outbound HTTPS.
 
-const app = express();
-const port = process.env.PORT || 9000;
+const http = require('http');
+const { WebSocketServer } = require('ws');
 
-app.get('/', (req, res) => {
-  res.send('Divide & Conquer PeerJS broker — alive');
+const PORT = process.env.PORT || 9000;
+const MAX_MSG_BYTES = 64 * 1024;
+const HEARTBEAT_MS = 25_000;
+const ROOM_TTL_MS = 30 * 60 * 1000;
+
+const rooms = new Map(); // code -> { host, joiner, createdAt }
+
+const server = http.createServer((req, res) => {
+  if (req.url === '/' || req.url === '/health') {
+    res.writeHead(200, { 'content-type': 'text/plain' });
+    res.end(`Divide & Conquer relay — alive. rooms=${rooms.size}`);
+    return;
+  }
+  res.writeHead(404); res.end();
 });
 
-const server = app.listen(port, () => {
-  console.log('Listening on', port);
+const wss = new WebSocketServer({ server, maxPayload: MAX_MSG_BYTES });
+
+function send(ws, obj) {
+  if (!ws || ws.readyState !== 1) return;
+  try { ws.send(JSON.stringify(obj)); } catch (_) {}
+}
+
+function partnerOf(room, ws) {
+  return room.host === ws ? room.joiner : room.host;
+}
+
+function closeRoom(code, reason) {
+  const room = rooms.get(code);
+  if (!room) return;
+  for (const peer of [room.host, room.joiner]) {
+    if (peer && peer.readyState === 1) {
+      send(peer, { type: 'partner-left', reason });
+      try { peer.close(1000, reason || 'room closed'); } catch (_) {}
+    }
+  }
+  rooms.delete(code);
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [code, room] of rooms) {
+    if (now - room.createdAt > ROOM_TTL_MS) closeRoom(code, 'ttl');
+  }
+}, 60_000);
+
+wss.on('connection', (ws, req) => {
+  ws.isAlive = true;
+  ws._code = null;
+  ws._role = null;
+  ws.on('pong', () => { ws.isAlive = true; });
+
+  ws.on('message', (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw.toString()); }
+    catch (_) { return; }
+    if (!msg || typeof msg !== 'object') return;
+
+    // ── Control messages ─────────────────────────────────────────
+    if (msg.type === 'host') {
+      const code = String(msg.code || '').toUpperCase().slice(0, 8);
+      if (!/^[A-Z0-9]{2,8}$/.test(code)) {
+        send(ws, { type: 'error', reason: 'bad-code' });
+        return;
+      }
+      if (rooms.has(code)) {
+        send(ws, { type: 'error', reason: 'code-taken' });
+        return;
+      }
+      rooms.set(code, { host: ws, joiner: null, createdAt: Date.now() });
+      ws._code = code; ws._role = 'host';
+      send(ws, { type: 'hosted', code });
+      console.log(`+ host ${code} (rooms=${rooms.size})`);
+      return;
+    }
+
+    if (msg.type === 'join') {
+      const code = String(msg.code || '').toUpperCase().slice(0, 8);
+      const room = rooms.get(code);
+      if (!room) { send(ws, { type: 'error', reason: 'no-room' }); return; }
+      if (room.joiner) { send(ws, { type: 'error', reason: 'room-full' }); return; }
+      room.joiner = ws;
+      ws._code = code; ws._role = 'joiner';
+      send(ws, { type: 'joined', code });
+      send(room.host, { type: 'partner-joined' });
+      console.log(`+ join ${code}`);
+      return;
+    }
+
+    // ── Data messages — relay to partner ─────────────────────────
+    if (msg.type === 'data') {
+      const room = rooms.get(ws._code);
+      if (!room) return;
+      const peer = partnerOf(room, ws);
+      send(peer, { type: 'data', payload: msg.payload });
+      return;
+    }
+  });
+
+  ws.on('close', () => {
+    if (!ws._code) return;
+    const room = rooms.get(ws._code);
+    if (!room) return;
+    const peer = partnerOf(room, ws);
+    if (peer && peer.readyState === 1) send(peer, { type: 'partner-left' });
+    console.log(`- ${ws._role} ${ws._code}`);
+    rooms.delete(ws._code);
+  });
+
+  ws.on('error', () => {});
 });
 
-const peerServer = ExpressPeerServer(server, {
-  path: '/',
-  allow_discovery: false,
-  proxied: true,
-});
+setInterval(() => {
+  for (const ws of wss.clients) {
+    if (!ws.isAlive) { try { ws.terminate(); } catch (_) {} continue; }
+    ws.isAlive = false;
+    try { ws.ping(); } catch (_) {}
+  }
+}, HEARTBEAT_MS);
 
-app.use('/peerjs', peerServer);
-
-peerServer.on('connection', (client) => console.log('+ peer', client.getId()));
-peerServer.on('disconnect', (client) => console.log('- peer', client.getId()));
+server.listen(PORT, () => console.log(`Relay listening on :${PORT}`));

@@ -1,14 +1,13 @@
 {
   "name": "dac-peerserver",
-  "version": "1.0.0",
-  "description": "PeerJS signaling broker for Divide & Conquer",
+  "version": "2.0.0",
+  "description": "WebSocket message relay for Divide & Conquer",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.19.2",
-    "peer": "^1.0.2"
+    "ws": "^8.18.0"
   },
   "engines": {
     "node": ">=18"
