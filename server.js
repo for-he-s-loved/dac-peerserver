@@ -9,8 +9,9 @@ const PORT = process.env.PORT || 9000;
 const MAX_MSG_BYTES = 64 * 1024;
 const HEARTBEAT_MS = 25_000;
 const ROOM_TTL_MS = 30 * 60 * 1000;
+const REJOIN_GRACE_MS = 90 * 1000; // keep a room alive this long after a drop
 
-const rooms = new Map(); // code -> { host, joiner, createdAt }
+const rooms = new Map(); // code -> { host, joiner, createdAt, emptySince }
 
 const server = http.createServer((req, res) => {
   if (req.url === '/' || req.url === '/health') {
@@ -47,9 +48,11 @@ function closeRoom(code, reason) {
 setInterval(() => {
   const now = Date.now();
   for (const [code, room] of rooms) {
-    if (now - room.createdAt > ROOM_TTL_MS) closeRoom(code, 'ttl');
+    if (now - room.createdAt > ROOM_TTL_MS) { closeRoom(code, 'ttl'); continue; }
+    // Reap rooms whose dropped player never came back within the grace period.
+    if (room.emptySince && now - room.emptySince > REJOIN_GRACE_MS) closeRoom(code, 'abandoned');
   }
-}, 60_000);
+}, 15_000);
 
 wss.on('connection', (ws, req) => {
   ws.isAlive = true;
@@ -87,6 +90,7 @@ wss.on('connection', (ws, req) => {
       if (!room) { send(ws, { type: 'error', reason: 'no-room' }); return; }
       if (room.joiner) { send(ws, { type: 'error', reason: 'room-full' }); return; }
       room.joiner = ws;
+      room.emptySince = null;
       ws._code = code; ws._role = 'joiner';
       send(ws, { type: 'joined', code });
       send(room.host, { type: 'partner-joined' });
@@ -94,35 +98,17 @@ wss.on('connection', (ws, req) => {
       return;
     }
 
-    // ── Data messages — relay to partner ─────────────────────────
-    if (msg.type === 'data') {
-      const room = rooms.get(ws._code);
-      if (!room) return;
-      const peer = partnerOf(room, ws);
-      send(peer, { type: 'data', payload: msg.payload });
-      return;
-    }
-  });
-
-  ws.on('close', () => {
-    if (!ws._code) return;
-    const room = rooms.get(ws._code);
-    if (!room) return;
-    const peer = partnerOf(room, ws);
-    if (peer && peer.readyState === 1) send(peer, { type: 'partner-left' });
-    console.log(`- ${ws._role} ${ws._code}`);
-    rooms.delete(ws._code);
-  });
-
-  ws.on('error', () => {});
-});
-
-setInterval(() => {
-  for (const ws of wss.clients) {
-    if (!ws.isAlive) { try { ws.terminate(); } catch (_) {} continue; }
-    ws.isAlive = false;
-    try { ws.ping(); } catch (_) {}
-  }
-}, HEARTBEAT_MS);
-
-server.listen(PORT, () => console.log(`Relay listening on :${PORT}`));
+    // A player whose socket dropped mid-game reclaims their slot.
+    if (msg.type === 'rejoin') {
+      const code = String(msg.code || '').toUpperCase().slice(0, 8);
+      const role = msg.role === 'host' ? 'host' : 'joiner';
+      const room = rooms.get(code);
+      if (!room) { send(ws, { type: 'error', reason: 'no-room' }); return; }
+      const current = room[role];
+      if (current && current !== ws && current.readyState === 1) {
+        send(ws, { type: 'error', reason: 'room-full' });
+        return;
+      }
+      room[role] = ws;
+      room.emptySince = (room.host && room.joiner) ? null : room.emptySince;
+      ws._code = code; ws._rol
