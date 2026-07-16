@@ -50,7 +50,14 @@ setInterval(() => {
   for (const [code, room] of rooms) {
     if (now - room.createdAt > ROOM_TTL_MS) { closeRoom(code, 'ttl'); continue; }
     // Reap rooms whose dropped player never came back within the grace period.
-    if (room.emptySince && now - room.emptySince > REJOIN_GRACE_MS) closeRoom(code, 'abandoned');
+    // Only when a slot is actually still empty — a stale emptySince left over
+    // after a successful rejoin must never kill a live pair.
+    const slotEmpty = !room.host || !room.joiner;
+    if (slotEmpty && room.emptySince && now - room.emptySince > REJOIN_GRACE_MS) {
+      closeRoom(code, 'abandoned');
+    } else if (!slotEmpty) {
+      room.emptySince = null;
+    }
   }
 }, 15_000);
 
@@ -112,9 +119,11 @@ wss.on('connection', (ws, req) => {
       room[role] = ws;
       room.emptySince = (room.host && room.joiner) ? null : room.emptySince;
       ws._code = code; ws._role = role;
-      send(ws, { type: 'rejoined', code });
       const peer = partnerOf(room, ws);
-      if (peer && peer.readyState === 1) send(peer, { type: 'partner-rejoined' });
+      const partnerHere = !!(peer && peer.readyState === 1);
+      // partner flag lets the client know whether queued messages can flush now
+      send(ws, { type: 'rejoined', code, partner: partnerHere });
+      if (partnerHere) send(peer, { type: 'partner-rejoined' });
       console.log(`+ rejoin ${role} ${code}`);
       return;
     }
@@ -133,11 +142,14 @@ wss.on('connection', (ws, req) => {
     if (!ws._code) return;
     const room = rooms.get(ws._code);
     if (!room) return;
+    // Ignore closes from stale sockets that were already replaced by a rejoin
+    // — otherwise a late TCP timeout would mark a live room as abandoned.
+    if (room[ws._role] !== ws) return;
     // Free the slot but keep the room for REJOIN_GRACE_MS so the player can
     // reconnect and resume — previously any drop instantly killed the room.
-    const peer = partnerOf(room, ws);
-    if (room[ws._role] === ws) room[ws._role] = null;
+    room[ws._role] = null;
     room.emptySince = Date.now();
+    const peer = ws._role === 'host' ? room.joiner : room.host;
     if (peer && peer.readyState === 1) send(peer, { type: 'partner-left' });
     console.log(`- ${ws._role} ${ws._code} (grace ${REJOIN_GRACE_MS / 1000}s)`);
   });
