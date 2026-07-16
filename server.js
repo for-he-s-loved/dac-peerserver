@@ -111,4 +111,46 @@ wss.on('connection', (ws, req) => {
       }
       room[role] = ws;
       room.emptySince = (room.host && room.joiner) ? null : room.emptySince;
-      ws._code = code; ws._rol
+      ws._code = code; ws._role = role;
+      send(ws, { type: 'rejoined', code });
+      const peer = partnerOf(room, ws);
+      if (peer && peer.readyState === 1) send(peer, { type: 'partner-rejoined' });
+      console.log(`+ rejoin ${role} ${code}`);
+      return;
+    }
+
+    // ── Data messages — relay to partner ─────────────────────────
+    if (msg.type === 'data') {
+      const room = rooms.get(ws._code);
+      if (!room) return;
+      const peer = partnerOf(room, ws);
+      send(peer, { type: 'data', payload: msg.payload });
+      return;
+    }
+  });
+
+  ws.on('close', () => {
+    if (!ws._code) return;
+    const room = rooms.get(ws._code);
+    if (!room) return;
+    // Free the slot but keep the room for REJOIN_GRACE_MS so the player can
+    // reconnect and resume — previously any drop instantly killed the room.
+    const peer = partnerOf(room, ws);
+    if (room[ws._role] === ws) room[ws._role] = null;
+    room.emptySince = Date.now();
+    if (peer && peer.readyState === 1) send(peer, { type: 'partner-left' });
+    console.log(`- ${ws._role} ${ws._code} (grace ${REJOIN_GRACE_MS / 1000}s)`);
+  });
+
+  ws.on('error', () => {});
+});
+
+setInterval(() => {
+  for (const ws of wss.clients) {
+    if (!ws.isAlive) { try { ws.terminate(); } catch (_) {} continue; }
+    ws.isAlive = false;
+    try { ws.ping(); } catch (_) {}
+  }
+}, HEARTBEAT_MS);
+
+server.listen(PORT, () => console.log(`Relay listening on :${PORT}`));
